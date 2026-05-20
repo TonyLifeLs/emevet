@@ -254,7 +254,7 @@ _COLUMN_MAP = {
     "participacion 2022": "Participacion2022",
     "participacion 2023": "Participacion2023",
     "participacion 2024": "Participacion2024",
-    "taza de crecimiento": "TasaCrecimiento",
+    "tasa de crecimiento": "TasaCrecimiento",
     "tasa de crecimiento": "TasaCrecimiento",
 }
 
