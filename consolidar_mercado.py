@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MERCADO_DIR = os.path.join(SCRIPT_DIR, "Mercado")
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "PrincipioActivoAnalisisMercado2026.xlsx")
+# Longitud mínima de un nombre de molécula individual para incluirlo en el índice
+MIN_MOLECULE_NAME_LENGTH = 3
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +71,7 @@ def _extraer_nombre_producto(presentacion: str) -> str:
 # Construcción del índice de ComponenteMolecular desde archivos Reporte
 # ---------------------------------------------------------------------------
 
-def construir_indice_componentes(patron_reporte: str) -> tuple[dict, set]:
+def construir_indice_componentes(patron_reporte: str) -> tuple[dict[str, str], set[str]]:
     """Lee todos los archivos Reporte y construye un índice de búsqueda.
 
     Devuelve una tupla (indice, moleculas):
@@ -126,13 +128,13 @@ def construir_indice_componentes(patron_reporte: str) -> tuple[dict, set]:
     for comp in componentes_set:
         for parte in comp.split(","):
             parte_clean = re.sub(r"\s+", " ", parte.strip())
-            if len(parte_clean) > 3:
+            if len(parte_clean) > MIN_MOLECULE_NAME_LENGTH:
                 moleculas.add(parte_clean)
 
     return indice, moleculas
 
 
-def buscar_componente(nombre_producto: str, indice: dict, moleculas: set) -> str:
+def buscar_componente(nombre_producto: str, indice: dict[str, str], moleculas: set[str]) -> str:
     """Intenta encontrar el ComponenteMolecular para un nombre de producto dado.
 
     Estrategia (en orden de prioridad):
