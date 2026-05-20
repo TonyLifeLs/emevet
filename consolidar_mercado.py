@@ -1,9 +1,13 @@
 """
 Consolidador de Principios Activos del Mercado 2026
 =====================================================
-Lee todos los archivos Excel de principios activos (Reporte_Por_Principio_Activo_2024_*.xlsx)
-y el análisis de mercado por sector (Mercado/AnalisisDelMercadoSector.xlsx),
-unifica la información y genera PrincipioActivoAnalisisMercado2026.xlsx.
+Lee el análisis de mercado (Mercado/AnalisisDelMercadoSector.xlsx) y todos los
+archivos de principios activos (Reporte_Por_Principio_Activo_2024_*.xlsx).
+
+Genera PrincipioActivoAnalisisMercado2026.xlsx conservando TODAS las columnas
+originales del análisis de mercado y agregando únicamente la columna
+ComponenteMolecular, obtenida cruzando el nombre de la presentación contra los
+componentes moleculares conocidos de los archivos Reporte.
 """
 
 import os
@@ -30,140 +34,153 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MERCADO_DIR = os.path.join(SCRIPT_DIR, "Mercado")
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "PrincipioActivoAnalisisMercado2026.xlsx")
 
-# Número de filas de encabezado institucional antes de la fila de columnas
-# en los archivos Reporte_Por_Principio_Activo_2024_*.xlsx
-HEADER_ROWS_REPORTE = 4
-
 
 # ---------------------------------------------------------------------------
-# Utilidades
+# Utilidades de normalización
 # ---------------------------------------------------------------------------
 
-def normalizar_texto(texto: str) -> str:
-    """Quita tildes, convierte a mayúsculas y elimina espacios redundantes."""
+def _normalizar(texto: str) -> str:
+    """Quita tildes, convierte a mayúsculas y colapsa espacios."""
     if not isinstance(texto, str):
-        return texto
+        return ""
     nfkd = unicodedata.normalize("NFKD", texto)
     sin_tildes = "".join(c for c in nfkd if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", sin_tildes).strip().upper()
 
 
-def normalizar_componente(componente: str) -> str:
-    """Normaliza el nombre de un componente molecular."""
-    return normalizar_texto(componente)
-
-
-def extraer_principio_activo(nombre_archivo: str) -> str:
-    """Extrae el nombre del principio activo a partir del nombre de archivo.
+def _extraer_nombre_producto(presentacion: str) -> str:
+    """Extrae el identificador del producto desde el campo Presentacion.
 
     Ejemplo:
-        Reporte_Por_Principio_Activo_2024_ANTIPARASITARIOS.xlsx
-        → ANTIPARASITARIOS
+        'DL-METHIONINA 99% - FUNDA - 1 KG'  →  'DL-METHIONINA'
+        'IVERMECTINA 1% - FRASCO - 500 ML'   →  'IVERMECTINA'
+        'CEVAC VITABRON L - VIAL - 200 ML'   →  'CEVAC VITABRON L'
     """
-    base = os.path.splitext(os.path.basename(nombre_archivo))[0]
-    # Patrón: Reporte_Por_Principio_Activo_YYYY_<CATEGORIA>
-    match = re.search(r"Reporte_Por_Principio_Activo_\d{4}_(.+)$", base, re.IGNORECASE)
-    if match:
-        categoria = match.group(1).replace("_", " ")
-        return normalizar_texto(categoria)
-    return normalizar_texto(base)
+    if not isinstance(presentacion, str):
+        return ""
+    # Tomar la parte antes del primer ' - '
+    nombre = presentacion.split(" - ")[0].strip()
+    # Eliminar indicadores de concentración/pureza al final (p.ej. "99%", "60%", "1%")
+    nombre = re.sub(r"\s+\d+[\.,]?\d*\s*%.*$", "", nombre).strip()
+    return _normalizar(nombre)
 
 
 # ---------------------------------------------------------------------------
-# Lectura de archivos Reporte
+# Construcción del índice de ComponenteMolecular desde archivos Reporte
 # ---------------------------------------------------------------------------
 
-def leer_reporte(ruta_archivo: str) -> pd.DataFrame:
-    """Lee un archivo Reporte_Por_Principio_Activo_*.xlsx y devuelve un DataFrame
-    con columnas estandarizadas más la columna PrincipioActivo."""
-    principio_activo = extraer_principio_activo(ruta_archivo)
-    frames = []
+def construir_indice_componentes(patron_reporte: str) -> tuple[dict, set]:
+    """Lee todos los archivos Reporte y construye un índice de búsqueda.
 
-    try:
-        excel = pd.ExcelFile(ruta_archivo, engine="openpyxl")
-    except Exception as exc:
-        logger.error("No se pudo abrir '%s': %s", ruta_archivo, exc)
-        return pd.DataFrame()
+    Devuelve una tupla (indice, moleculas):
+    - indice: dict  componente_normalizado → ComponenteMolecular_completo
+    - moleculas: set de moléculas individuales (tokens separados por coma)
+    """
+    componentes_set: set[str] = set()
+    archivos = sorted(glob.glob(patron_reporte))
+    logger.info("Leyendo componentes desde %d archivos Reporte …", len(archivos))
 
-    for sheet_name in excel.sheet_names:
+    for ruta in archivos:
         try:
-            # Detectar la fila de encabezado buscando "Numero" en la primera columna
-            raw = pd.read_excel(
-                excel,
-                sheet_name=sheet_name,
-                header=None,
-                dtype=str,
-            )
-            header_idx = None
-            for idx, row in raw.iterrows():
-                first_cell = str(row.iloc[0]).strip().lower() if pd.notna(row.iloc[0]) else ""
-                if first_cell == "numero":
-                    header_idx = idx
-                    break
-
-            if header_idx is None:
-                logger.warning(
-                    "Hoja '%s' en '%s': no se encontró fila de encabezado, se omite.",
-                    sheet_name,
-                    os.path.basename(ruta_archivo),
-                )
-                continue
-
-            df = pd.read_excel(
-                excel,
-                sheet_name=sheet_name,
-                header=header_idx,
-                dtype=str,
-            )
-
-            # Renombrar columnas al estándar
-            rename_map = {
-                col: _normalizar_nombre_columna(col) for col in df.columns
-            }
-            df.rename(columns=rename_map, inplace=True)
-
-            # Conservar solo filas con ComponenteMolecular no nulo
-            if "ComponenteMolecular" not in df.columns:
-                logger.warning(
-                    "Hoja '%s' en '%s': columna 'Componente Molecular' no encontrada.",
-                    sheet_name,
-                    os.path.basename(ruta_archivo),
-                )
-                continue
-
-            df = df[df["ComponenteMolecular"].notna()].copy()
-            df = df[df["ComponenteMolecular"].str.strip() != ""].copy()
-
-            # Normalizar componente molecular
-            df["ComponenteMolecular"] = df["ComponenteMolecular"].apply(normalizar_componente)
-
-            # Agregar columnas de identificación
-            df.insert(0, "PrincipioActivo", principio_activo)
-            df["FuenteArchivo"] = os.path.basename(ruta_archivo)
-            df["HojaOrigen"] = sheet_name
-
-            frames.append(df)
-
+            excel = pd.ExcelFile(ruta, engine="openpyxl")
         except Exception as exc:
-            logger.error(
-                "Error leyendo hoja '%s' en '%s': %s",
-                sheet_name,
-                os.path.basename(ruta_archivo),
-                exc,
-            )
+            logger.error("No se pudo abrir '%s': %s", os.path.basename(ruta), exc)
+            continue
 
-    if not frames:
-        return pd.DataFrame()
+        for sheet_name in excel.sheet_names:
+            try:
+                raw = pd.read_excel(excel, sheet_name=sheet_name, header=None, dtype=str)
+                header_idx = None
+                for idx, row in raw.iterrows():
+                    if str(row.iloc[0]).strip().lower() == "numero":
+                        header_idx = idx
+                        break
+                if header_idx is None:
+                    continue
+                df = pd.read_excel(excel, sheet_name=sheet_name, header=header_idx, dtype=str)
+                col_comp = next(
+                    (c for c in df.columns if "componente" in c.lower()),
+                    None,
+                )
+                if col_comp is None:
+                    continue
+                for valor in df[col_comp].dropna():
+                    norma = _normalizar(valor)
+                    if norma:
+                        componentes_set.add(norma)
+            except Exception as exc:
+                logger.error(
+                    "Error en hoja '%s' de '%s': %s",
+                    sheet_name,
+                    os.path.basename(ruta),
+                    exc,
+                )
 
-    return pd.concat(frames, ignore_index=True)
+    logger.info("  Componentes únicos cargados: %d", len(componentes_set))
+
+    # Índice directo: ComponenteMolecular completo → sí mismo
+    indice: dict[str, str] = {comp: comp for comp in componentes_set}
+
+    # Moléculas individuales (tokens): cada sub-componente separado por coma
+    moleculas: set[str] = set()
+    for comp in componentes_set:
+        for parte in comp.split(","):
+            parte_clean = re.sub(r"\s+", " ", parte.strip())
+            if len(parte_clean) > 3:
+                moleculas.add(parte_clean)
+
+    return indice, moleculas
+
+
+def buscar_componente(nombre_producto: str, indice: dict, moleculas: set) -> str:
+    """Intenta encontrar el ComponenteMolecular para un nombre de producto dado.
+
+    Estrategia (en orden de prioridad):
+    1. Coincidencia exacta del nombre del producto con el ComponenteMolecular completo.
+    2. El nombre del producto coincide exactamente con un sub-componente individual
+       (token separado por coma) de algún ComponenteMolecular.
+    3. El nombre del producto es prefijo de algún ComponenteMolecular completo
+       (límite de palabra: espacio, coma o fin de cadena).
+    Si no hay coincidencia, devuelve el propio nombre del producto (mejor esfuerzo).
+    """
+    if not nombre_producto:
+        return ""
+
+    # 1. Coincidencia exacta con ComponenteMolecular completo
+    if nombre_producto in indice:
+        return indice[nombre_producto]
+
+    # 2. El nombre coincide exactamente con una molécula individual (token exacto)
+    if nombre_producto in moleculas:
+        # Buscar el ComponenteMolecular completo que contiene esta molécula como único token
+        for comp in sorted(indice, key=len):
+            tokens = {t.strip() for t in comp.split(",")}
+            if nombre_producto in tokens and len(tokens) == 1:
+                return comp
+        # Es parte de una mezcla: devolver el nombre del producto como está
+        return nombre_producto
+
+    # 3. El nombre del producto es prefijo exacto de algún ComponenteMolecular
+    #    (protegido con límite de palabra: espacio, coma o fin de cadena)
+    patron = re.compile(
+        r"^" + re.escape(nombre_producto) + r"(?:\s|,|$)",
+        re.IGNORECASE,
+    )
+    for comp in sorted(indice, key=len):
+        if patron.match(comp):
+            return indice[comp]
+
+    # Sin coincidencia: usar el propio nombre del producto como ComponenteMolecular
+    return nombre_producto
 
 
 # ---------------------------------------------------------------------------
-# Lectura del análisis de mercado por sector
+# Lectura del análisis de mercado conservando columnas originales
 # ---------------------------------------------------------------------------
 
 def leer_analisis_mercado(ruta_archivo: str) -> pd.DataFrame:
-    """Lee AnalisisDelMercadoSector.xlsx y devuelve un DataFrame normalizado."""
+    """Lee un archivo de análisis de mercado y devuelve un DataFrame con
+    TODAS sus columnas originales, sin renombrar ni transformar."""
     frames = []
 
     try:
@@ -186,25 +203,29 @@ def leer_analisis_mercado(ruta_archivo: str) -> pd.DataFrame:
 
             if header_idx is None:
                 logger.warning(
-                    "Hoja '%s' en '%s': no se encontró fila de encabezado.",
+                    "Hoja '%s' en '%s': encabezado no encontrado, se omite.",
                     sheet_name,
                     os.path.basename(ruta_archivo),
                 )
                 continue
 
+            # Leer con los encabezados originales del archivo
             df = pd.read_excel(excel, sheet_name=sheet_name, header=header_idx, dtype=str)
 
-            rename_map = {col: _normalizar_nombre_columna(col) for col in df.columns}
-            df.rename(columns=rename_map, inplace=True)
+            # Eliminar fila de totales y filas vacías en Presentacion
+            col_pres = next(
+                (c for c in df.columns if str(c).strip().lower() == "presentacion"),
+                None,
+            )
+            if col_pres:
+                df = df[df[col_pres].notna()].copy()
+                df = df[
+                    ~df[col_pres].str.strip().str.upper().isin(["TOTALES", ""])
+                ].copy()
+                df[col_pres] = df[col_pres].str.strip()
 
-            # Conservar solo filas con Presentacion no nula ni "TOTALES"
-            if "Presentacion" in df.columns:
-                df = df[df["Presentacion"].notna()].copy()
-                df = df[~df["Presentacion"].str.strip().str.upper().isin(["TOTALES", ""])].copy()
-                df["Presentacion"] = df["Presentacion"].str.strip()
-
-            df["FuenteArchivo"] = os.path.basename(ruta_archivo)
-            df["HojaOrigen"] = sheet_name
+            # Eliminar columnas completamente vacías que pandas puede generar
+            df.dropna(axis=1, how="all", inplace=True)
 
             frames.append(df)
 
@@ -223,193 +244,72 @@ def leer_analisis_mercado(ruta_archivo: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Normalización de nombres de columnas
-# ---------------------------------------------------------------------------
-
-_COLUMN_MAP = {
-    "numero": "Numero",
-    "componente molecular": "ComponenteMolecular",
-    "componentemolecular": "ComponenteMolecular",
-    "primer trimestre": "PrimerTrimestre",
-    "primertrimestre": "PrimerTrimestre",
-    "segundo trimestre": "SegundoTrimestre",
-    "segundotrimestre": "SegundoTrimestre",
-    "tercer trimestre": "TercerTrimestre",
-    "tercertrimestre": "TercerTrimestre",
-    "cuarto trimestre": "CuartoTrimestre",
-    "cuartotrimestre": "CuartoTrimestre",
-    "total ventas": "TotalVentas",
-    "totalventas": "TotalVentas",
-    "presentacion": "Presentacion",
-    "empresa": "Empresa",
-    "laboratorio": "Laboratorio",
-    "rank": "Rank",
-    "detalles 2022": "Detalles2022",
-    "detalles 2023": "Detalles2023",
-    "detalles 2024": "Detalles2024",
-    "detalles trimestre i": "DetallesTrimestreI",
-    "detalles trimestre ii": "DetallesTrimestreII",
-    "detalles trimestre iii": "DetallesTrimestreIII",
-    "detalles trimestre iv": "DetallesTrimestreIV",
-    "participacion 2022": "Participacion2022",
-    "participacion 2023": "Participacion2023",
-    "participacion 2024": "Participacion2024",
-    "tasa de crecimiento": "TasaCrecimiento",
-    "tasa de crecimiento": "TasaCrecimiento",
-}
-
-
-def _normalizar_nombre_columna(nombre: str) -> str:
-    """Mapea nombres de columnas a nombres estandarizados."""
-    if not isinstance(nombre, str):
-        return str(nombre)
-    key = normalizar_texto(nombre).lower()
-    # Buscar coincidencia exacta
-    if key in _COLUMN_MAP:
-        return _COLUMN_MAP[key]
-    # Buscar coincidencia parcial
-    for patron, estandar in _COLUMN_MAP.items():
-        if patron in key or key in patron:
-            return estandar
-    # Sin coincidencia: devolver camelCase simple quitando espacios
-    return re.sub(r"\s+", "", nombre.title())
-
-
-# ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
 
 def consolidar():
     logger.info("=== Consolidador de Principios Activos del Mercado 2026 ===")
 
-    # 1. Leer todos los archivos Reporte_Por_Principio_Activo_2024_*.xlsx
+    # 1. Construir índice de ComponenteMolecular desde archivos Reporte
     patron_reporte = os.path.join(SCRIPT_DIR, "Reporte_Por_Principio_Activo_2024_*.xlsx")
-    archivos_reporte = sorted(glob.glob(patron_reporte))
-    logger.info("Archivos Reporte encontrados: %d", len(archivos_reporte))
+    indice_componentes, moleculas = construir_indice_componentes(patron_reporte)
 
-    dfs_reporte = []
-    for archivo in archivos_reporte:
-        logger.info("  Leyendo: %s", os.path.basename(archivo))
-        df = leer_reporte(archivo)
-        if not df.empty:
-            dfs_reporte.append(df)
-
-    df_principios = pd.concat(dfs_reporte, ignore_index=True) if dfs_reporte else pd.DataFrame()
-    logger.info("Filas consolidadas de Reportes: %d", len(df_principios))
-
-    # Limpiar: eliminar duplicados exactos
-    if not df_principios.empty:
-        antes = len(df_principios)
-        df_principios.drop_duplicates(
-            subset=["PrincipioActivo", "ComponenteMolecular"],
-            inplace=True,
-        )
-        logger.info(
-            "Duplicados eliminados (PrincipioActivo+ComponenteMolecular): %d → %d",
-            antes,
-            len(df_principios),
-        )
-
-    # 2. Leer AnalisisDelMercadoSector.xlsx desde carpeta Mercado
+    # 2. Leer todos los archivos de análisis de mercado (carpeta Mercado)
     archivos_mercado = sorted(glob.glob(os.path.join(MERCADO_DIR, "*.xlsx")))
     logger.info("Archivos en carpeta Mercado: %d", len(archivos_mercado))
 
-    dfs_mercado = []
-    for archivo in archivos_mercado:
-        logger.info("  Leyendo: %s", os.path.basename(archivo))
-        df = leer_analisis_mercado(archivo)
+    dfs = []
+    for ruta in archivos_mercado:
+        logger.info("  Leyendo: %s", os.path.basename(ruta))
+        df = leer_analisis_mercado(ruta)
         if not df.empty:
-            dfs_mercado.append(df)
+            dfs.append(df)
 
-    df_mercado = pd.concat(dfs_mercado, ignore_index=True) if dfs_mercado else pd.DataFrame()
-    logger.info("Filas consolidadas del Mercado: %d", len(df_mercado))
-
-    if not df_mercado.empty:
-        antes = len(df_mercado)
-        df_mercado.drop_duplicates(subset=["Presentacion"], inplace=True)
-        logger.info(
-            "Duplicados eliminados (Presentacion): %d → %d",
-            antes,
-            len(df_mercado),
-        )
-
-    # 3. Generar el archivo consolidado con múltiples hojas
-    if df_principios.empty and df_mercado.empty:
-        logger.error("No se encontró ningún dato para consolidar. Saliendo.")
+    if not dfs:
+        logger.error("No se encontró ningún dato en la carpeta Mercado. Saliendo.")
         return
 
-    logger.info("Generando '%s' ...", OUTPUT_FILE)
+    df_mercado = pd.concat(dfs, ignore_index=True)
+    logger.info("Total filas del análisis de mercado: %d", len(df_mercado))
 
+    # 3. Agregar columna ComponenteMolecular
+    col_pres = next(
+        (c for c in df_mercado.columns if str(c).strip().lower() == "presentacion"),
+        None,
+    )
+    if col_pres is None:
+        logger.error("No se encontró la columna 'Presentacion' en los datos de mercado.")
+        return
+
+    logger.info("Asociando ComponenteMolecular a cada Presentacion …")
+
+    def _asignar_componente(presentacion: str) -> str:
+        nombre_prod = _extraer_nombre_producto(presentacion)
+        return buscar_componente(nombre_prod, indice_componentes, moleculas)
+
+    df_mercado["ComponenteMolecular"] = df_mercado[col_pres].apply(_asignar_componente)
+
+    # Mover ComponenteMolecular justo después de Presentacion
+    cols = list(df_mercado.columns)
+    cols.remove("ComponenteMolecular")
+    pos = cols.index(col_pres) + 1
+    cols.insert(pos, "ComponenteMolecular")
+    df_mercado = df_mercado[cols]
+
+    # Eliminar duplicados
+    antes = len(df_mercado)
+    df_mercado.drop_duplicates(subset=[col_pres], inplace=True)
+    logger.info("Filas únicas (por Presentacion): %d → %d", antes, len(df_mercado))
+
+    # 4. Guardar el archivo de salida
+    logger.info("Generando '%s' …", OUTPUT_FILE)
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-
-        # --- Hoja 1: Principios Activos y Componentes Moleculares ---
-        if not df_principios.empty:
-            # Columnas prioritarias al frente
-            cols_front = [
-                "PrincipioActivo",
-                "ComponenteMolecular",
-                "TotalVentas",
-                "PrimerTrimestre",
-                "SegundoTrimestre",
-                "TercerTrimestre",
-                "CuartoTrimestre",
-            ]
-            cols_extra = [c for c in df_principios.columns if c not in cols_front]
-            cols_orden = [c for c in cols_front if c in df_principios.columns] + cols_extra
-            df_principios[cols_orden].to_excel(
-                writer,
-                sheet_name="PrincipiosActivos",
-                index=False,
-            )
-            logger.info(
-                "  Hoja 'PrincipiosActivos': %d filas, %d columnas",
-                len(df_principios),
-                len(cols_orden),
-            )
-
-        # --- Hoja 2: Análisis del Mercado por Sector ---
-        if not df_mercado.empty:
-            cols_front_m = [
-                "Presentacion",
-                "Empresa",
-                "Laboratorio",
-                "Detalles2024",
-                "Detalles2023",
-                "Detalles2022",
-                "Participacion2024",
-                "TasaCrecimiento",
-            ]
-            cols_extra_m = [c for c in df_mercado.columns if c not in cols_front_m]
-            cols_orden_m = [c for c in cols_front_m if c in df_mercado.columns] + cols_extra_m
-            df_mercado[cols_orden_m].to_excel(
-                writer,
-                sheet_name="MercadoSector",
-                index=False,
-            )
-            logger.info(
-                "  Hoja 'MercadoSector': %d filas, %d columnas",
-                len(df_mercado),
-                len(cols_orden_m),
-            )
-
-        # --- Hoja 3: Resumen por PrincipioActivo ---
-        if not df_principios.empty and "TotalVentas" in df_principios.columns:
-            df_principios["TotalVentas_num"] = pd.to_numeric(
-                df_principios["TotalVentas"], errors="coerce"
-            )
-            resumen = (
-                df_principios.groupby("PrincipioActivo", sort=True)
-                .agg(
-                    CantidadComponentes=("ComponenteMolecular", "count"),
-                    TotalVentas=("TotalVentas_num", "sum"),
-                )
-                .reset_index()
-                .sort_values("TotalVentas", ascending=False)
-            )
-            resumen.to_excel(writer, sheet_name="ResumenPorPrincipioActivo", index=False)
-            logger.info(
-                "  Hoja 'ResumenPorPrincipioActivo': %d filas", len(resumen)
-            )
+        df_mercado.to_excel(writer, sheet_name="AnalisisMercado2026", index=False)
+        logger.info(
+            "  Hoja 'AnalisisMercado2026': %d filas, %d columnas",
+            len(df_mercado),
+            len(df_mercado.columns),
+        )
 
     logger.info("Archivo generado exitosamente: %s", OUTPUT_FILE)
 
