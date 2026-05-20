@@ -1,11 +1,20 @@
 """
 Genera PrincipioActivoAnalisisMercado2026.xlsx consolidando:
-- Todos los archivos Reporte_Por_Principio_Activo_2024_*.xlsx (ComponenteMolecular + ventas por categoria)
-- Mercado/AnalisisDelMercadoSector.xlsx (Presentaciones + datos de mercado)
 
-Para cada Presentacion en el archivo de Mercado se extrae el PrincipioActivo
-(parte antes del primer ' - ') y se busca el ComponenteMolecular correspondiente
-en los archivos de Reporte, normalizando los nombres para comparacion.
+- Todos los archivos Excel dentro de la carpeta "Mercado/" (fuente de presentaciones)
+- Todos los archivos Reporte_Por_Principio_Activo_2024_*.xlsx en el directorio raíz
+  (fuente de ComponenteMolecular y datos de ventas por categoría)
+
+Lógica de enriquecimiento (como químico):
+1. Para cada Presentacion se extrae el PrincipioActivo y se busca su ComponenteMolecular
+   en los archivos de Reporte mediante normalización química (acentos, prefijos
+   estereoquímicos, sufijos de sales, equivalencias inglés/español).
+2. Propagación: si un PrincipioActivo ya tiene ComponenteMolecular en alguna fila,
+   ese valor se propaga a las demás presentaciones del mismo PA que no tengan uno.
+3. Simulación: si tras la búsqueda y propagación un PA sigue sin ComponenteMolecular,
+   se genera un valor coherente basado en el nombre del PA (diccionario de drogas
+   conocidas o "COMPUESTO GENERICO_" + nombre).
+4. El campo final se llama ComponenteMolecularFinal y NUNCA queda vacío.
 """
 
 import glob
@@ -17,7 +26,7 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de normalización
+# Utilidades de normalización química
 # ---------------------------------------------------------------------------
 
 def quitar_acentos(texto: str) -> str:
@@ -26,9 +35,8 @@ def quitar_acentos(texto: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-# Equivalencias ortográficas: español ↔ inglés / variantes de escritura
-# clave = forma a normalizar → valor = forma canónica en los Reportes
-EQUIVALENCIAS = {
+# Equivalencias ortográficas: inglés / variantes → español canónico
+EQUIVALENCIAS: dict[str, str] = {
     "METHIONINA": "METIONINA",
     "METHIONINE": "METIONINA",
     "LYSINE": "LISINA",
@@ -63,7 +71,6 @@ EQUIVALENCIAS = {
     "ENROFLOXACIN": "ENROFLOXACINA",
     "CIPROFLOXACIN": "CIPROFLOXACINA",
     "NORFLOXACIN": "NORFLOXACINA",
-    "FLORFENICOL": "FLORFENICOL",
     "TILMICOSIN": "TILMICOSINA",
     "TYLOSIN": "TILOSINA",
     "LINCOMYCIN": "LINCOMICINA",
@@ -71,14 +78,12 @@ EQUIVALENCIAS = {
     "COLISTIN": "COLISTINA",
     "DEXAMETHASONE": "DEXAMETASONA",
     "PREDNISOLONE": "PREDNISOLONA",
-    "MELOXICAM": "MELOXICAM",
     "KETAMINE": "KETAMINA",
     "XYLAZINE": "XILAZINA",
     "BUTORPHANOL": "BUTORFANOL",
     "OXYTOCIN": "OXITOCINA",
     "PROGESTERONE": "PROGESTERONA",
     "TESTOSTERONE": "TESTOSTERONA",
-    "ESTRADIOL": "ESTRADIOL",
     "SELENIUM": "SELENIO",
     "VITAMIN": "VITAMINA",
     "VITAMINS": "VITAMINAS",
@@ -93,7 +98,6 @@ EQUIVALENCIAS = {
     "LEVAMISOLE": "LEVAMISOL",
     "NICLOSAMIDE": "NICLOSAMIDA",
     "PYRANTEL": "PIRANTEL",
-
     "ZINC": "ZINC",
     "COPPER": "COBRE",
     "MANGANESE": "MANGANESO",
@@ -106,110 +110,305 @@ EQUIVALENCIAS = {
     "IODINE": "YODO",
 }
 
-# Palabras calificadoras (especie, vía, marca) que no forman parte del nombre molecular
-PALABRAS_NO_MOLECULARES = re.compile(
-    r"\b(AVICOLA|AVIAR|BOVINO|BOVINA|CANINO|CANINA|FELINO|FELINA|EQUINO|EQUINA|"
+# Palabras calificadoras que no forman parte del nombre molecular
+_CALIFICADORAS = (
+    r"AVICOLA|AVIAR|BOVINO|BOVINA|CANINO|CANINA|FELINO|FELINA|EQUINO|EQUINA|"
     r"PORCINO|PORCINA|OVINO|OVINA|CAPRINO|CAPRINA|CUNICULAR|"
     r"INYECTABLE|ORAL|TOPICO|TOPICA|INTRAVENOSO|SUBCUTANEO|"
     r"FORTE|PLUS|ULTRA|SUPER|MAX|PRO|PREMIUM|EXTRA|SPECIAL|"
-    r"AVICOLA|PECUARIO|VETERINARIO|VETERINARIA)\b",
-    re.IGNORECASE,
+    r"PECUARIO|VETERINARIO|VETERINARIA"
 )
+PALABRAS_NO_MOLECULARES = re.compile(rf"\b({_CALIFICADORAS})\b", re.IGNORECASE)
 
-# Prefijos de marca conocidos (cortos, al inicio del texto)
+# Prefijos de marca cortos al inicio del texto
 PREFIJOS_MARCA = re.compile(r"^(LH|VM|BM|AG|QSI|MC)\s*", re.IGNORECASE)
 
-# Prefijos estereoquímicos/de forma que no definen la molécula
+# Prefijos estereoquímicos que no cambian la identidad de la molécula
 PREFIJOS_QUIRALES = re.compile(
-    r"^(DL|L|D|R|S|MESO|CIS|TRANS|N|O|S|ALFA|BETA|GAMMA|DELTA)-\s*", re.IGNORECASE
+    r"^(DL|L|D|R|S|MESO|CIS|TRANS|ALFA|BETA|GAMMA|DELTA)-\s*", re.IGNORECASE
 )
 
-# Sufijos de sales / formas farmacéuticas que no cambian el PA
+# Sufijos de sales / formas farmacéuticas
 SUFIJOS_SALES = re.compile(
     r"\s+(HCL|CLORHIDRATO|HIDROCLORURO|SULFATO|FOSFATO|TARTRATO|CITRATO|LACTATO|"
     r"GLUCONATO|ACETATO|NITRATO|BROMURO|YODURO|MALEATO|FUMARATO|SUCCINATO|"
-    r"SÓDICO|SODICO|POTÁSICO|POTASICO|MAGNÉSICO|MAGNESICO|AMÓNICO|AMONICO|"
+    r"SODICO|POTASICO|MAGNESICO|AMONICO|SODICO|POTASICO|"
     r"TRIHIDRATADO|TRIHIDRATADA|MONOHIDRATADO|HIDRATADO|ANHIDRO|BASE|"
     r"MICRONIZADO|MICRONIZADA|GRANULADO|GRANULADA|POLVO)$",
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Diccionario de simulación química
+# Patrón en el nombre del PA → ComponenteMolecularFinal simulado
+# ---------------------------------------------------------------------------
+SIMULACION_DROGAS: list[tuple[str, str]] = [
+    # Antiparasitarios
+    (r"IVERMECT",       "IVERMECTINA"),
+    (r"DORAMECT",       "DORAMECTINA"),
+    (r"ABAMECT",        "ABAMECTINA"),
+    (r"MOXIDECT",       "MOXIDECTINA"),
+    (r"EPRINOMECT",     "EPRINOMECTINA"),
+    (r"ALBENDAZ",       "ALBENDAZOL"),
+    (r"FENBENDAZ",      "FENBENDAZOL"),
+    (r"FLUBENDAZ",      "FLUBENDAZOL"),
+    (r"OXIBENDAZ",      "OXIBENDAZOL"),
+    (r"MEBENDAZ",       "MEBENDAZOL"),
+    (r"PRAZIQUANT",     "PRAZICUANTEL"),
+    (r"LEVAMIS",        "LEVAMISOL"),
+    (r"NICLOSAMID",     "NICLOSAMIDA"),
+    (r"PIRANTEL",       "PIRANTEL"),
+    (r"CLOSANTEL",      "CLOSANTEL"),
+    (r"TRICLABENDAZ",   "TRICLABENDAZOL"),
+    (r"MONENSINA",      "MONENSINA SODICA"),
+    (r"LASALOCID",      "LASALOCID SODICO"),
+    (r"SALINOMICIN",    "SALINOMICINA"),
+    (r"NARASIN",        "NARASINA"),
+    (r"ROBENIDINA",     "ROBENIDIN"),
+    (r"DICLAZURIL",     "DICLAZURIL"),
+    (r"TOLTRAZURIL",    "TOLTRAZURIL"),
+    (r"AMPROLIUM",      "AMPROLIUM"),
+    # Antibióticos
+    (r"ENROFLOXAC",     "ENROFLOXACINA"),
+    (r"CIPROFLOXAC",    "CIPROFLOXACINA"),
+    (r"NORFLOXAC",      "NORFLOXACINA"),
+    (r"DANOFLOXAC",     "DANOFLOXACINA"),
+    (r"MARBOFLOXAC",    "MARBOFLOXACINA"),
+    (r"FLORFENICOB?",    "FLORFENICOL"),
+    (r"OXITETRACICL",   "OXITETRACICLINA"),
+    (r"DOXICICL",       "DOXICICLINA"),
+    (r"TETRACICLINA",   "TETRACICLINA"),
+    (r"CLORTETRACICLINA","CLORTETRACICLINA"),
+    (r"TILVALOSINA",    "TILVALOSINA"),
+    (r"TILMICOSINA",    "TILMICOSINA"),
+    (r"TILOSINA",       "TILOSINA TARTRATO"),
+    (r"ERITROMICIN",    "ERITROMICINA"),
+    (r"LINCOMICIN",     "LINCOMICINA"),
+    (r"ESPECTINOMICIN", "ESPECTINOMICINA"),
+    (r"NEOMICIN",       "NEOMICINA SULFATO"),
+    (r"GENTAMICIN",     "GENTAMICINA SULFATO"),
+    (r"AMIKACIN",       "AMIKACINA"),
+    (r"ESTREPTOMICIN",  "ESTREPTOMICINA"),
+    (r"DIHIDROESTREPT", "DIHIDROESTREPTOMICINA"),
+    (r"PENICILINA",     "PENICILINA G PROCAINA"),
+    (r"PENICILLI",      "PENICILINA G PROCAINA"),
+    (r"AMPICILI",       "AMPICILINA TRIHIDRATADA"),
+    (r"AMOXICILI",      "AMOXICILINA TRIHIDRATADA"),
+    (r"CLOXA",          "CLOXACILINA SODICA"),
+    (r"CEFTIOFUR",      "CEFTIOFUR CLORHIDRATO"),
+    (r"CEFADROXIL",     "CEFADROXIL"),
+    (r"COLISTIN",       "COLISTINA SULFATO"),
+    (r"AVILAMICIN",     "AVILAMICINA"),
+    (r"SULFADIAZIN",    "SULFADIAZINA"),
+    (r"SULFAMETAZIN",   "SULFAMETAZINA"),
+    (r"SULFADIMIDINA",  "SULFADIMIDINA"),
+    (r"TRIMETO",        "TRIMETOPRIMA"),
+    # AINEs / Analgésicos
+    (r"MELOXICAM",      "MELOXICAM"),
+    (r"CARPROFENO",     "CARPROFENO"),
+    (r"DICLOFENAC",     "DICLOFENACO SODICO"),
+    (r"FLUNIXIN",       "FLUNIXIN MEGLUMINE"),
+    (r"FENILBUTAZON",   "FENILBUTAZONA"),
+    (r"KETOPROFENO",    "KETOPROFENO"),
+    (r"IBUPROFENO",     "IBUPROFENO"),
+    (r"PARACETAMOL",    "ACETAMINOFEN"),
+    (r"ACETAMINOFEN",   "ACETAMINOFEN"),
+    # Corticoides / Hormonas
+    (r"DEXAMETASON",    "DEXAMETASONA"),
+    (r"PREDNISOLON",    "PREDNISOLONA"),
+    (r"CORTISOL",       "HIDROCORTISONA"),
+    (r"BETAMETASON",    "BETAMETASONA"),
+    (r"PROGESTERON",    "PROGESTERONA"),
+    (r"TESTOSTERON",    "TESTOSTERONA PROPIONATO"),
+    (r"ESTRADIOL",      "ESTRADIOL BENZOATO"),
+    (r"OXITOCINA",      "OXITOCINA"),
+    (r"OXYTOCIN",       "OXITOCINA"),
+    (r"GONADOTROP",     "GONADOTROPINA CORIONICA"),
+    (r"FSH",            "HORMONA FOLICULOESTIMULANTE"),
+    (r"GNRH|GONADOR",   "GONADORELINA"),
+    (r"INSULINA",       "INSULINA"),
+    (r"SOMATOTROPIN",   "SOMATOTROPINA BOVINA"),
+    # Anestésicos / Sedantes
+    (r"KETAMINA",       "KETAMINA CLORHIDRATO"),
+    (r"XILAZINA",       "XILAZINA CLORHIDRATO"),
+    (r"BUTORFANOL",     "BUTORFANOL TARTRATO"),
+    (r"ROMIFIDINA",     "ROMIFIDINA"),
+    (r"DETOMIDINA",     "DETOMIDINA"),
+    (r"MEDETOMIDINA",   "MEDETOMIDINA"),
+    (r"PROPOFOL",       "PROPOFOL"),
+    (r"TILETAMINA",     "TILETAMINA"),
+    (r"ZOLAZEPAM",      "ZOLAZEPAM"),
+    # Vitaminas y aminoácidos
+    (r"METIONINA|METHIONIN", "METIONINA"),
+    (r"LISINA",         "LISINA"),
+    (r"TREONINA",       "TREONINA"),
+    (r"TRIPTOFANO",     "TRIPTOFANO"),
+    (r"ARGININA",       "ARGININA"),
+    (r"VALINA",         "VALINA"),
+    (r"LEUCINA",        "LEUCINA"),
+    (r"ISOLEUCINA",     "ISOLEUCINA"),
+    (r"GLICINA",        "GLICINA"),
+    (r"COLINA",         "CLORURO DE COLINA"),
+    (r"VITAMINA A",     "VITAMINA A (RETINOL)"),
+    (r"VITAMINA D",     "VITAMINA D3 (COLECALCIFEROL)"),
+    (r"VITAMINA E",     "VITAMINA E (ALFA-TOCOFEROL)"),
+    (r"VITAMINA K",     "VITAMINA K3 (MENADIONA)"),
+    (r"VITAMINA C",     "ACIDO ASCORBICO"),
+    (r"VITAMINA B1",    "TIAMINA"),
+    (r"VITAMINA B2",    "RIBOFLAVINA"),
+    (r"VITAMINA B6",    "PIRIDOXINA"),
+    (r"VITAMINA B12",   "CIANOCOBALAMINA"),
+    (r"BIOTINA",        "BIOTINA"),
+    (r"ACIDO FOLICO",   "ACIDO FOLICO"),
+    (r"NIACINA",        "NIACINA"),
+    # Minerales
+    (r"CALCIO",         "CALCIO"),
+    (r"FOSFORO",        "FOSFORO"),
+    (r"MAGNESIO",       "MAGNESIO"),
+    (r"ZINC",           "ZINC"),
+    (r"COBRE",          "SULFATO DE COBRE"),
+    (r"MANGANESO",      "MANGANESO"),
+    (r"HIERRO",         "HIERRO DEXTRANO"),
+    (r"SELENIO",        "SELENITO DE SODIO"),
+    (r"YODO",           "YODURO DE POTASIO"),
+    (r"CROMO",          "PICOLINATO DE CROMO"),
+    # Otros
+    (r"BROMHEXIN",      "BROMHEXINA CLORHIDRATO"),
+    (r"FUROSEMID",      "FUROSEMIDA"),
+    (r"ATROPINA",       "ATROPINA SULFATO"),
+    (r"EPINEFRINA|ADRENALINA", "EPINEFRINA"),
+    (r"DIGOXINA",       "DIGOXINA"),
+    (r"SILIMARINA",     "SILIMARINA"),
+    (r"OMEPRAZOL",      "OMEPRAZOL"),
+    (r"RANITIDINA",     "RANITIDINA"),
+    (r"METOCLOPRAMID",  "METOCLOPRAMIDA"),
+    (r"DIFENHIDRAMINA", "DIFENHIDRAMINA"),
+    (r"CLORFENAMINA",   "CLORFENAMINA"),
+    (r"DEXCLORFENIRAMINA", "DEXCLORFENIRAMINA"),
+    (r"AZITROMICIN",    "AZITROMICINA"),
+    (r"CEFAZOLINA",     "CEFAZOLINA"),
+    (r"SULFATO DE ZINC","SULFATO DE ZINC"),
+    (r"CLORURO DE SODIO","CLORURO DE SODIO"),
+]
+# Compilar los patrones de simulación una sola vez
+SIMULACION_COMPILADA: list[tuple[re.Pattern, str]] = [
+    (re.compile(patron, re.IGNORECASE), componente)
+    for patron, componente in SIMULACION_DROGAS
+]
+
+# Alias de columnas → nombre canónico
+ALIAS_COLUMNAS: dict[str, str] = {
+    # PrincipioActivo
+    "principio activo": "PrincipioActivo",
+    "principioactivo": "PrincipioActivo",
+    "principio": "PrincipioActivo",
+    "producto": "PrincipioActivo",
+    "nombre": "PrincipioActivo",
+    # Presentacion
+    "presentacion": "Presentacion",
+    "presentación": "Presentacion",
+    "forma farmaceutica": "Presentacion",
+    "forma farmacéutica": "Presentacion",
+    "forma": "Presentacion",
+    # ComponenteMolecular
+    "componente molecular": "ComponenteMolecular",
+    "componentemolecular": "ComponenteMolecular",
+    "composicion": "ComponenteMolecular",
+    "composición": "ComponenteMolecular",
+    "ingrediente activo": "ComponenteMolecular",
+    "ingredienteactivo": "ComponenteMolecular",
+    "ingrediente": "ComponenteMolecular",
+    "principio activo molecular": "ComponenteMolecular",
+}
+
+
+# ---------------------------------------------------------------------------
+# Funciones de normalización
+# ---------------------------------------------------------------------------
 
 def normalizar(texto: str) -> str:
-    """Normaliza un nombre para comparación:
-    - Mayúsculas
-    - Sin tildes
-    - Sin porcentajes ni concentraciones (p.ej. '99%', '60%')
-    - Espacios únicos y sin bordes
-    """
+    """Normalización básica: mayúsculas, sin tildes, sin porcentajes, espacios limpios."""
     if not isinstance(texto, str):
         return ""
     texto = texto.upper()
     texto = quitar_acentos(texto)
-    # Eliminar porcentajes y concentraciones numéricas (98%, 98,5%, etc.)
     texto = re.sub(r"\d+[.,]?\d*\s*%", "", texto)
-    # Eliminar guiones y hifens sobrantes al final de palabra
     texto = re.sub(r"-\s*$", "", texto)
-    # Eliminar espacios múltiples
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
+    return re.sub(r"\s+", " ", texto).strip()
 
 
 def normalizar_pa(texto: str) -> str:
-    """Normalización ampliada para el PrincipioActivo extraído de la Presentacion.
-    Aplica la normalización básica + equivalencias ortográficas + limpieza de
-    prefijos estereoquímicos y sufijos de sales.
+    """Normalización química ampliada del PrincipioActivo:
+    elimina prefijos estereoquímicos, sufijos de sales, calificadoras y prefijos de marca.
     """
     base = normalizar(texto)
-
-    # 1. Remover prefijos estereoquímicos de una sola letra al inicio (L-, DL-, etc.)
-    #    Se hace ANTES de las equivalencias para que "DL-METHIONINA" → "METHIONINA"
     base = PREFIJOS_QUIRALES.sub("", base).strip()
-
-    # 2. Aplicar equivalencias ortográficas (palabra a palabra)
-    palabras = base.split()
-    palabras = [EQUIVALENCIAS.get(p, p) for p in palabras]
+    palabras = [EQUIVALENCIAS.get(p, p) for p in base.split()]
     base = " ".join(palabras)
-
-    # 3. Remover sufijos de sales / formas farmacéuticas
     prev = None
     while prev != base:
         prev = base
         base = SUFIJOS_SALES.sub("", base).strip()
-
-    # 4. Remover palabras calificadoras (especie, vía de administración, marca)
     base = PALABRAS_NO_MOLECULARES.sub("", base).strip()
-    # 5. Remover prefijos de marca conocidos al inicio
     base = PREFIJOS_MARCA.sub("", base).strip()
-    # 6. Limpiar espacios múltiples tras los reemplazos
     base = re.sub(r"\s+", " ", base).strip()
-
-    # 7. Limpiar texto numérico de concentración al final (ej. "LISINA 98")
     base = re.sub(r"\s+\d+[\.,]?\d*\s*$", "", base).strip()
-
     return base
 
 
+def simular_componente_molecular(principio_activo: str) -> str:
+    """Genera un ComponenteMolecular coherente cuando no se puede obtener de los datos.
+
+    Estrategia:
+    1. Buscar el nombre del PA en el diccionario de drogas conocidas.
+    2. Si no se identifica → "COMPUESTO GENERICO_" + nombre normalizado del PA.
+    """
+    pa_norm = normalizar(principio_activo)
+    if not pa_norm:
+        return "COMPUESTO GENERICO_DESCONOCIDO"
+
+    for patron, componente in SIMULACION_COMPILADA:
+        if patron.search(pa_norm):
+            return componente
+
+    # Fallback genérico
+    return f"COMPUESTO GENERICO_{pa_norm}"
+
+
 def extraer_principio_activo(presentacion: str) -> str:
-    """Extrae el nombre del principio activo desde el string de presentación.
-    Formato esperado: 'NOMBRE DEL PRODUCTO - ENVASE - CANTIDAD'
+    """Extrae el nombre del PA desde el string de presentación.
+    Formato: 'NOMBRE DEL PRODUCTO - ENVASE - CANTIDAD'
     """
     if not isinstance(presentacion, str):
         return ""
-    # Tomar la parte antes del primer ' - '
-    partes = presentacion.split(" - ", 1)
-    return partes[0].strip()
+    return presentacion.split(" - ", 1)[0].strip()
+
+
+def detectar_y_renombrar_columnas(df: pd.DataFrame) -> pd.DataFrame:
+    """Renombra columnas usando el diccionario de alias hacia el nombre canónico."""
+    rename = {}
+    for col in df.columns:
+        col_lower = str(col).strip().lower()
+        if col_lower in ALIAS_COLUMNAS:
+            rename[col] = ALIAS_COLUMNAS[col_lower]
+    return df.rename(columns=rename) if rename else df
 
 
 # ---------------------------------------------------------------------------
-# Lectura de archivos de Reporte (ComponenteMolecular por Categoria)
+# Lectura de archivos Reporte (fuente de ComponenteMolecular)
 # ---------------------------------------------------------------------------
+
+def _detectar_header_row(df_raw: pd.DataFrame, marcadores: list[str]) -> int | None:
+    """Detecta la fila de encabezado buscando los marcadores dados."""
+    for idx, row in df_raw.iterrows():
+        vals_lower = [str(v).strip().lower() for v in row]
+        if any(m.lower() in v for m in marcadores for v in vals_lower):
+            return idx
+    return None
+
 
 def leer_reporte_archivo(ruta: str) -> pd.DataFrame:
-    """Lee un archivo Reporte_Por_Principio_Activo y devuelve un DataFrame
-    con columnas: Categoria, ComponenteMolecular, PrimerTrimestre,
-    SegundoTrimestre, TercerTrimestre, CuartoTrimestre, TotalVentas
-    """
+    """Lee un archivo Reporte_Por_Principio_Activo y devuelve un DataFrame normalizado."""
     categoria = (
         os.path.basename(ruta)
         .replace("Reporte_Por_Principio_Activo_2024_", "")
@@ -229,39 +428,21 @@ def leer_reporte_archivo(ruta: str) -> pd.DataFrame:
             print(f"  [ERROR] Hoja '{hoja}' en {ruta}: {exc}")
             continue
 
-        # Detectar fila de encabezado buscando la columna 'Componente Molecular'
-        header_row = None
-        for idx, row in df_raw.iterrows():
-            vals = [str(v).strip() for v in row]
-            if any("Componente Molecular" in v for v in vals):
-                header_row = idx
-                break
-
+        header_row = _detectar_header_row(df_raw, ["Componente Molecular", "ComponenteMolecular"])
         if header_row is None:
-            print(f"  [AVISO] No se encontró encabezado en {ruta} hoja '{hoja}'")
             continue
 
         df = pd.read_excel(ruta, sheet_name=hoja, header=header_row)
+        df = detectar_y_renombrar_columnas(df)
 
-        # Renombrar columnas clave
-        rename = {}
+        # Renombrar columnas de ventas para evitar colisiones al unir
+        rename_ventas = {}
         for col in df.columns:
             col_s = str(col).strip()
-            if col_s == "Componente Molecular":
-                rename[col] = "ComponenteMolecular"
-            elif col_s == "Primer Trimestre":
-                rename[col] = "PrimerTrimestre_Reporte"
-            elif col_s == "Segundo Trimestre":
-                rename[col] = "SegundoTrimestre_Reporte"
-            elif col_s == "Tercer Trimestre":
-                rename[col] = "TercerTrimestre_Reporte"
-            elif col_s == "Cuarto Trimestre":
-                rename[col] = "CuartoTrimestre_Reporte"
-            elif col_s == "Total Ventas":
-                rename[col] = "TotalVentas_Reporte"
-            elif col_s == "Numero":
-                rename[col] = "Numero_Reporte"
-        df = df.rename(columns=rename)
+            if col_s in ("Primer Trimestre", "Segundo Trimestre", "Tercer Trimestre",
+                         "Cuarto Trimestre", "Total Ventas", "Numero"):
+                rename_ventas[col] = col_s.replace(" ", "") + "_Reporte"
+        df = df.rename(columns=rename_ventas)
 
         if "ComponenteMolecular" not in df.columns:
             continue
@@ -292,127 +473,139 @@ def cargar_todos_los_reportes(directorio: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     resultado = pd.concat(partes, ignore_index=True)
-    # Eliminar filas sin ComponenteMolecular y duplicados exactos
     resultado = resultado[resultado["ComponenteMolecular"].astype(str).str.strip() != ""]
     resultado.drop_duplicates(subset=["Categoria", "ComponenteMolecular"], inplace=True)
     resultado.reset_index(drop=True, inplace=True)
-    print(f"  → {len(resultado)} filas de ComponenteMolecular cargadas.")
+    print(f"  → {len(resultado)} registros de ComponenteMolecular cargados.")
     return resultado
 
 
 # ---------------------------------------------------------------------------
-# Lectura del archivo de Mercado
+# Lectura de archivos del Mercado
 # ---------------------------------------------------------------------------
 
-def cargar_mercado(ruta: str) -> pd.DataFrame:
-    """Carga el archivo de mercado y estandariza columnas."""
+def leer_mercado_archivo(ruta: str) -> pd.DataFrame:
+    """Lee un archivo Excel del directorio Mercado (puede tener múltiples hojas)."""
     try:
-        df_raw = pd.read_excel(ruta, header=None)
+        xl = pd.ExcelFile(ruta)
     except Exception as exc:
-        print(f"[ERROR] No se pudo abrir {ruta}: {exc}")
+        print(f"  [ERROR] No se pudo abrir {ruta}: {exc}")
         return pd.DataFrame()
 
-    # Detectar fila de encabezado buscando 'Presentacion'
-    header_row = None
-    for idx, row in df_raw.iterrows():
-        vals = [str(v).strip() for v in row]
-        if any("Presentacion" in v for v in vals):
-            header_row = idx
-            break
+    frames = []
+    for hoja in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(ruta, sheet_name=hoja, header=None)
+        except Exception as exc:
+            print(f"  [ERROR] Hoja '{hoja}' en {ruta}: {exc}")
+            continue
 
-    if header_row is None:
-        print(f"[AVISO] No se encontró encabezado 'Presentacion' en {ruta}")
+        # Detectar fila de encabezado buscando columnas relevantes
+        header_row = _detectar_header_row(
+            df_raw,
+            ["Presentacion", "Presentación", "PrincipioActivo", "Principio Activo",
+             "ComponenteMolecular", "Componente Molecular"]
+        )
+        if header_row is None:
+            print(f"  [AVISO] No se encontró encabezado reconocible en '{os.path.basename(ruta)}' hoja '{hoja}'")
+            continue
+
+        df = pd.read_excel(ruta, sheet_name=hoja, header=header_row)
+        df = detectar_y_renombrar_columnas(df)
+
+        # Sólo conservar filas con al menos una columna de interés con dato
+        cols_utiles = [c for c in ("PrincipioActivo", "Presentacion", "ComponenteMolecular") if c in df.columns]
+        if not cols_utiles:
+            continue
+
+        df = df.dropna(subset=cols_utiles, how="all")
+        df["_ArchivoFuente"] = os.path.basename(ruta)
+        df["_HojaFuente"] = hoja
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def cargar_directorio_mercado(directorio_mercado: str) -> pd.DataFrame:
+    """Carga todos los Excel del directorio Mercado."""
+    archivos = sorted(glob.glob(os.path.join(directorio_mercado, "*.xlsx")))
+    print(f"Se encontraron {len(archivos)} archivo(s) en Mercado/.")
+    partes = []
+    for ruta in archivos:
+        nombre = os.path.basename(ruta)
+        print(f"  Leyendo: {nombre}")
+        df = leer_mercado_archivo(ruta)
+        if not df.empty:
+            partes.append(df)
+
+    if not partes:
         return pd.DataFrame()
 
-    df = pd.read_excel(ruta, header=header_row)
-    df = df[df["Presentacion"].notna()].copy()
-    df.reset_index(drop=True, inplace=True)
-    print(f"  → {len(df)} presentaciones cargadas del Mercado.")
-    return df
+    resultado = pd.concat(partes, ignore_index=True)
+    print(f"  → {len(resultado)} filas cargadas del Mercado.")
+    return resultado
 
 
 # ---------------------------------------------------------------------------
-# Motor de emparejamiento: Presentacion ↔ ComponenteMolecular
+# Motor de emparejamiento: PrincipioActivo ↔ ComponenteMolecular
 # ---------------------------------------------------------------------------
 
 def construir_indice_componentes(df_reportes: pd.DataFrame) -> list[dict]:
-    """Construye una lista de dicts con la clave normalizada de cada componente."""
+    """Construye índice de búsqueda sobre los ComponenteMolecular de los Reportes."""
     indice = []
     for _, fila in df_reportes.iterrows():
         cm = str(fila["ComponenteMolecular"]).strip()
-        indice.append(
-            {
-                "ComponenteMolecular": cm,
-                "ComponenteMolecular_norm": normalizar(cm),
-                "Categoria": fila.get("Categoria", ""),
-                "_fila": fila,
-            }
-        )
+        indice.append({
+            "ComponenteMolecular": cm,
+            "ComponenteMolecular_norm": normalizar(cm),
+            "Categoria": fila.get("Categoria", ""),
+        })
     return indice
 
 
-def _es_componente_simple(cm_norm: str) -> bool:
-    """Devuelve True si el ComponenteMolecular normalizado es de molécula única
-    (no contiene comas, es decir, no es una combinación de varios activos).
-    """
+def _es_simple(cm_norm: str) -> bool:
     return "," not in cm_norm
 
 
-def buscar_mejor_componente(principio_activo: str, indice: list[dict]) -> dict | None:
-    """Busca en el índice el ComponenteMolecular que mejor corresponde al
-    principio activo extraído de la Presentacion.
-
-    Estrategia (en orden de prioridad):
-    1. Coincidencia exacta del PA normalizado con el CM normalizado
-       (tanto con normalización simple como con normalización ampliada)
-    2. El CM es de molécula única y el PA normalizado está contenido en él
-       (mínimo 4 chars, para evitar coincidencias espurias)
-    3. El PA normalizado es substring del CM (moléculas compuestas),
-       priorizando el CM más corto (más específico)
-    4. Búsqueda por palabras significativas del PA (≥6 chars) en CM únicos
-    """
-    # Generar variantes normalizadas del PA
+def buscar_componente(principio_activo: str, indice: list[dict]) -> str | None:
+    """Busca el mejor ComponenteMolecular en el índice para un PrincipioActivo dado."""
     pa_basico = normalizar(principio_activo)
     pa_amplio = normalizar_pa(principio_activo)
 
-    variantes = {pa_basico, pa_amplio}
-    variantes.discard("")
-
+    variantes = {v for v in (pa_basico, pa_amplio) if v}
     if not variantes:
         return None
 
-    # --- 1. Coincidencia exacta (cualquier variante) ---
+    # 1. Coincidencia exacta
     for item in indice:
-        cm_n = item["ComponenteMolecular_norm"]
-        if cm_n in variantes:
-            return item
+        if item["ComponenteMolecular_norm"] in variantes:
+            return item["ComponenteMolecular"]
 
-    # --- 2 y 3. Búsqueda por inclusión/substring ---
-    for pa_norm in sorted(variantes, key=len, reverse=True):  # más específica primero
-        if len(pa_norm) < 4:
+    # 2 y 3. Búsqueda por inclusión (más largo primero para mayor especificidad)
+    for pa in sorted(variantes, key=len, reverse=True):
+        if len(pa) < 4:
             continue
-
-        simples = [item for item in indice if _es_componente_simple(item["ComponenteMolecular_norm"]) and pa_norm in item["ComponenteMolecular_norm"]]
-        compuestos = [item for item in indice if not _es_componente_simple(item["ComponenteMolecular_norm"]) and pa_norm in item["ComponenteMolecular_norm"]]
-
-        # Preferir componentes simples que contengan el PA
+        simples = [it for it in indice if _es_simple(it["ComponenteMolecular_norm"]) and pa in it["ComponenteMolecular_norm"]]
+        compuestos = [it for it in indice if not _es_simple(it["ComponenteMolecular_norm"]) and pa in it["ComponenteMolecular_norm"]]
         if simples:
-            return min(simples, key=lambda x: len(x["ComponenteMolecular_norm"]))
+            return min(simples, key=lambda x: len(x["ComponenteMolecular_norm"]))["ComponenteMolecular"]
         if compuestos:
-            return min(compuestos, key=lambda x: len(x["ComponenteMolecular_norm"]))
+            return min(compuestos, key=lambda x: len(x["ComponenteMolecular_norm"]))["ComponenteMolecular"]
 
-    # --- 4. Palabras significativas (≥6 chars) del PA en CMs simples ---
-    for pa_norm in sorted(variantes, key=len, reverse=True):
-        palabras = [p for p in pa_norm.split() if len(p) >= 6]
+    # 4. Palabras clave (≥6 chars) del PA en componentes simples
+    for pa in sorted(variantes, key=len, reverse=True):
+        palabras = [p for p in pa.split() if len(p) >= 6]
         if not palabras:
             continue
         mejores = [
-            item for item in indice
-            if _es_componente_simple(item["ComponenteMolecular_norm"])
-            and all(p in item["ComponenteMolecular_norm"] for p in palabras)
+            it for it in indice
+            if _es_simple(it["ComponenteMolecular_norm"])
+            and all(p in it["ComponenteMolecular_norm"] for p in palabras)
         ]
         if mejores:
-            return min(mejores, key=lambda x: len(x["ComponenteMolecular_norm"]))
+            return min(mejores, key=lambda x: len(x["ComponenteMolecular_norm"]))["ComponenteMolecular"]
 
     return None
 
@@ -421,76 +614,150 @@ def buscar_mejor_componente(principio_activo: str, indice: list[dict]) -> dict |
 # Consolidación principal
 # ---------------------------------------------------------------------------
 
-def consolidar(directorio: str, ruta_mercado: str, ruta_salida: str) -> None:
-    print("\n=== Cargando archivos de Reporte (ComponenteMolecular) ===")
+def consolidar(directorio: str, directorio_mercado: str, ruta_salida: str) -> None:
+    print("\n=== [1/4] Cargando archivos de Reporte (ComponenteMolecular) ===")
     df_reportes = cargar_todos_los_reportes(directorio)
 
-    print("\n=== Cargando archivo de Mercado (Presentaciones) ===")
-    df_mercado = cargar_mercado(ruta_mercado)
+    print("\n=== [2/4] Cargando archivos del Mercado (Presentaciones) ===")
+    df = cargar_directorio_mercado(directorio_mercado)
 
-    if df_mercado.empty:
-        print("[ERROR] No se pudo cargar el archivo de Mercado. Abortando.")
+    if df.empty:
+        print("[ERROR] No se pudo cargar ningún archivo del Mercado. Abortando.")
         return
 
-    # Construir índice de componentes para búsqueda
+    # -----------------------------------------------------------------------
+    # Extraer PrincipioActivo si no existe como columna explícita
+    # -----------------------------------------------------------------------
+    if "PrincipioActivo" not in df.columns:
+        if "Presentacion" in df.columns:
+            df["PrincipioActivo"] = df["Presentacion"].apply(
+                lambda x: extraer_principio_activo(str(x)) if pd.notna(x) else ""
+            )
+        else:
+            df["PrincipioActivo"] = ""
+
+    # Normalizar texto en columnas clave
+    for col in ("PrincipioActivo", "Presentacion"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().str.upper()
+            df[col] = df[col].replace("NAN", "")
+
+    # -----------------------------------------------------------------------
+    # [3/4] Enriquecer con ComponenteMolecular desde los Reportes
+    # -----------------------------------------------------------------------
+    print("\n=== [3/4] Asociando ComponenteMolecular a cada PrincipioActivo ===")
+
     indice = construir_indice_componentes(df_reportes) if not df_reportes.empty else []
 
-    # -----------------------------------------------------------------------
-    # Enriquecer cada fila del Mercado con PrincipioActivo + ComponenteMolecular
-    # -----------------------------------------------------------------------
-    print("\n=== Asociando ComponenteMolecular a cada Presentacion ===")
-    principios = []
-    componentes = []
-    categorias = []
-    coincidencias = 0
+    # Inicializar ComponenteMolecularFinal con lo que ya exista en los datos
+    if "ComponenteMolecular" in df.columns:
+        df["ComponenteMolecularFinal"] = df["ComponenteMolecular"].astype(str).str.strip()
+        df["ComponenteMolecularFinal"] = df["ComponenteMolecularFinal"].replace({"NAN": "", "nan": ""})
+    else:
+        df["ComponenteMolecularFinal"] = ""
 
-    for presentacion in df_mercado["Presentacion"]:
-        pa = extraer_principio_activo(str(presentacion))
-        match = buscar_mejor_componente(pa, indice)
-        principios.append(pa)
-        if match:
-            componentes.append(match["ComponenteMolecular"])
-            categorias.append(match["Categoria"])
-            coincidencias += 1
-        else:
-            componentes.append("NO IDENTIFICADO")
-            categorias.append("")
+    # Buscar en los Reportes para filas sin ComponenteMolecular
+    busquedas_exitosas = 0
+    for idx, fila in df.iterrows():
+        if df.at[idx, "ComponenteMolecularFinal"]:
+            continue
+        pa = str(fila.get("PrincipioActivo", "") or "").strip()
+        if not pa:
+            continue
+        cm = buscar_componente(pa, indice)
+        if cm:
+            df.at[idx, "ComponenteMolecularFinal"] = cm
+            busquedas_exitosas += 1
 
-    df_mercado.insert(0, "PrincipioActivo", principios)
-    df_mercado.insert(1, "ComponenteMolecular", componentes)
-    df_mercado.insert(2, "Categoria", categorias)
-
-    total = len(df_mercado)
-    print(f"  → {coincidencias}/{total} presentaciones con ComponenteMolecular identificado.")
+    print(f"  → {busquedas_exitosas} filas enriquecidas desde Reportes.")
 
     # -----------------------------------------------------------------------
-    # Limpiar y estandarizar el DataFrame resultante
+    # Propagación: si un PA ya tiene CM en alguna fila, propagar a las demás
     # -----------------------------------------------------------------------
-    # Estandarizar nombres de columnas: sin espacios en extremos
-    df_mercado.columns = [str(c).strip() for c in df_mercado.columns]
+    print("\n=== [3b] Propagación de ComponenteMolecular entre presentaciones ===")
+    propagaciones = 0
 
-    # Eliminar filas completamente vacías
-    df_mercado.dropna(how="all", inplace=True)
+    # Construir mapa PA → mejor CM (el más corto como proxy del más específico de molécula simple)
+    pa_a_cm: dict[str, str] = {}
+    for idx, fila in df.iterrows():
+        pa = str(fila.get("PrincipioActivo", "") or "").strip()
+        cm = str(fila.get("ComponenteMolecularFinal", "") or "").strip()
+        if pa and cm:
+            # Preferir CMs ya asignados (no genéricos)
+            if pa not in pa_a_cm or (
+                not pa_a_cm[pa].startswith("COMPUESTO GENERICO_")
+                and len(cm) < len(pa_a_cm[pa])
+            ):
+                pa_a_cm[pa] = cm
 
-    # Eliminar duplicados en combinación PrincipioActivo + Presentacion
-    df_mercado.drop_duplicates(subset=["PrincipioActivo", "Presentacion"], inplace=True)
-    df_mercado.reset_index(drop=True, inplace=True)
+    # Propagar
+    for idx, fila in df.iterrows():
+        pa = str(fila.get("PrincipioActivo", "") or "").strip()
+        if not df.at[idx, "ComponenteMolecularFinal"] and pa in pa_a_cm:
+            df.at[idx, "ComponenteMolecularFinal"] = pa_a_cm[pa]
+            propagaciones += 1
+
+    print(f"  → {propagaciones} filas completadas por propagación.")
+
+    # -----------------------------------------------------------------------
+    # Simulación: generar CM para los PAs que aún no tienen ninguno
+    # -----------------------------------------------------------------------
+    print("\n=== [3c] Simulación química para PAs sin ComponenteMolecular ===")
+    simulaciones = 0
+
+    for idx, fila in df.iterrows():
+        if df.at[idx, "ComponenteMolecularFinal"]:
+            continue
+        pa = str(fila.get("PrincipioActivo", "") or "").strip()
+        presentacion = str(fila.get("Presentacion", "") or "").strip()
+        nombre_base = pa if pa else presentacion
+        cm_simulado = simular_componente_molecular(nombre_base)
+        df.at[idx, "ComponenteMolecularFinal"] = cm_simulado
+        simulaciones += 1
+
+    print(f"  → {simulaciones} componentes simulados.")
+
+    # -----------------------------------------------------------------------
+    # Limpieza final
+    # -----------------------------------------------------------------------
+    df.columns = [str(c).strip() for c in df.columns]
+    df.dropna(how="all", inplace=True)
+
+    # Eliminar duplicados: misma PA + Presentacion (si existen ambas columnas)
+    dup_cols = [c for c in ("PrincipioActivo", "Presentacion") if c in df.columns]
+    if dup_cols:
+        df.drop_duplicates(subset=dup_cols, inplace=True)
+
+    df.reset_index(drop=True, inplace=True)
+
+    # Garantía final: ComponenteMolecularFinal nunca vacío
+    mask_vacio = df["ComponenteMolecularFinal"].astype(str).str.strip() == ""
+    if mask_vacio.any():
+        for idx in df[mask_vacio].index:
+            pa = str(df.at[idx, "PrincipioActivo"] if "PrincipioActivo" in df.columns else "")
+            df.at[idx, "ComponenteMolecularFinal"] = simular_componente_molecular(pa)
+
+    # Reordenar columnas: primero las canónicas, luego el resto
+    col_prio = ["PrincipioActivo", "Presentacion", "ComponenteMolecularFinal"]
+    otras = [c for c in df.columns if c not in col_prio]
+    df = df[[c for c in col_prio if c in df.columns] + otras]
 
     # -----------------------------------------------------------------------
     # Guardar el resultado
     # -----------------------------------------------------------------------
-    print(f"\n=== Guardando resultado en: {ruta_salida} ===")
+    print(f"\n=== [4/4] Guardando resultado en: {ruta_salida} ===")
     with pd.ExcelWriter(ruta_salida, engine="openpyxl") as writer:
-        df_mercado.to_excel(writer, sheet_name="Consolidado", index=False)
+        df.to_excel(writer, sheet_name="Consolidado", index=False)
 
-        # Hoja auxiliar: todos los ComponenteMolecular de los Reportes
         if not df_reportes.empty:
             df_reportes.to_excel(writer, sheet_name="ReportesComponentes", index=False)
 
+    total = len(df)
+    con_cm = (df["ComponenteMolecularFinal"].astype(str).str.strip() != "").sum()
     print(f"  → Archivo guardado: {ruta_salida}")
-    print(f"  → Filas en hoja 'Consolidado': {len(df_mercado)}")
+    print(f"  → Filas en 'Consolidado': {total} | Con ComponenteMolecularFinal: {con_cm}/{total}")
     if not df_reportes.empty:
-        print(f"  → Filas en hoja 'ReportesComponentes': {len(df_reportes)}")
+        print(f"  → Filas en 'ReportesComponentes': {len(df_reportes)}")
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +768,6 @@ if __name__ == "__main__":
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     consolidar(
         directorio=BASE_DIR,
-        ruta_mercado=os.path.join(BASE_DIR, "Mercado", "AnalisisDelMercadoSector.xlsx"),
+        directorio_mercado=os.path.join(BASE_DIR, "Mercado"),
         ruta_salida=os.path.join(BASE_DIR, "PrincipioActivoAnalisisMercado2026.xlsx"),
     )
